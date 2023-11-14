@@ -1,0 +1,229 @@
+
+
+       Create a specialized run target for Goa
+
+
+If you need special services for your Goa project, you can easily create a
+customized run target for testing your project. I will describe how you can
+achieve this in this article with two simple examples.
+
+
+[https://github.com/genodelabs/goa.git - Goa] is a Tool that helps you port Posix
+applications to the Genode OS framework. It also provides a handy way to test your
+custom Genode sub-system. All the standard services the framework provides can be
+used by simply adding them to the runtime file of the package description as follows:
+
+!<runtime>
+!	<requires>
+!		<nic tap_name="things"/>
+!		<terminal label="random"/>
+!	</requires>
+!	...
+!	<config>
+!		<parent-provides>
+!			<service name="Nic"/>
+!			<service name="Terminal"/>
+!			...
+!		</parent-provides>
+!		...
+!	</config>
+!</runtime>
+
+With the requires sub-nodes, you specify that the project requires a Nic and a
+Terminal session.
+
+Adding a custom run target is as simple as adding a file to the directory
+_share/goa/lib/run_ of your Goa repository. The name of the file determines the
+name of the target. The extension needs to be .tcl. In our case, the file is:
+! share/goa/lib/run/iot_gateway-linux.tcl
+
+We want to use most parts from the original _linux_ target. Therefore, the first
+line of the new target includes the original _linux.tcl_ script as follows:
+!source [file join $tool_dir lib run linux.tcl]
+
+In the current form, you can already run Goa projects with the new target:
+! goa run --target iot_gateway-linux
+
+
+Specialized nic router config
+-----------------------------
+
+By default, for each Nic session, the following components are started:
+* linux_nic_drv is mapped to the Linux TAP device with the name
+  given in the _tap_name_ attribute.
+* nic_router connects your Nic session to the Uplink session of the
+  NIC driver.
+
+If you want to use inbound connections, such as an HTTP server running inside
+your project, you need to create some code to provide this.
+
+TCL allows you to "overload" procedures, but by that, you lose access to the
+original procedure. To solve this problem, TCL has a cool feature I just
+learned about:
+!rename _instantiate_network _instantiate_network-vanilla
+
+After you have added this line to _share/goa/lib/run/iot_gateway-linux.tcl_ you now
+can implement a new procedure called __instantiate_network_ that creates you special
+configuration as follows:
+
+!# This overloads the _instantiate_network with our own version
+!proc _instantiate_network { tap_name subnet_id &start_nodes &archives &modules } {
+!	upvar 1 ${&start_nodes} start_nodes
+!	upvar 1 ${&archives} archives
+!	upvar 1 ${&modules} modules
+!
+!	global run_as
+!
+!	# If the name of the TAP device is "things" we configure the inbound
+!	# port forwarding on tap1.
+!	# If you use this do NOT use tap1 for an other Nic session.
+!	if {$tap_name == "things"} {
+!		set driver_name nic_drv_$tap_name
+!		set router_name nic_router_$tap_name
+!
+!		append start_nodes {
+!				<start name="} $driver_name {" caps="100" ld="no">
+!					<binary name="linux_nic_drv"/>
+!					<resource name="RAM" quantum="4M"/>
+!					<provides> <service name="Nic"/> </provides>}
+!		if {$tap_name != ""} {
+!			append start_nodes {
+!					<config tap="tap1"/>}
+!		}
+!		append start_nodes {
+!					<route>
+!						<service name="Uplink"> <child name="} $router_name {"/> </service>
+!						<any-service> <parent/> </any-service>
+!					</route>
+!				</start>
+!				<start name="} $router_name {" caps="200">
+!					<binary name="nic_router"/>
+!					<resource name="RAM" quantum="10M"/>
+!					<provides>
+!						<service name="Uplink"/>
+!						<service name="Nic"/>
+!					</provides>
+!					<config verbose_domain_state="yes">
+!						<policy label="} $driver_name { -> " domain="things"/>
+!						<default-policy domain="thing_servers"/>
+!						<domain name="thing_servers" interface="10.10.30.1/24">
+!							<dhcp-server ip_first="10.10.30.2" ip_last="10.10.30.2"/>
+!						</domain>
+!						<domain name="things" interface="169.254.71.254/24" gateway="169.254.71.1">
+!							<tcp-forward port="80" domain="thing_servers" to="10.10.30.2"/>
+!							<tcp-forward port="443" domain="thing_servers" to="10.10.30.2"/>
+!						</domain>
+!					</config>
+!					<route>
+!						<service name="Timer"> <child name="timer"/> </service>
+!						<any-service> <parent/> </any-service>
+!					</route>
+!				</start>
+!		}
+!	} else {
+!		return [_instantiate_network-vanilla $tap_name $subnet_id start_nodes archives modules]
+!	}
+!	lappend modules linux_nic_drv nic_router
+!
+!	lappend archives "$run_as/src/linux_nic_drv"
+!	lappend archives "$run_as/src/nic_router"
+!
+!	return $router_name
+!}
+
+
+Adding a random source
+----------------------
+
+Some of our projects need a random source via the Terminal session. Something that
+the default Linux target doesn't provide. In Genode, the _jitter_sponge_ component
+provides a _Terminal_ session from which one can read pseudo-random values.
+
+Which services need to be provided is determined by the _bind_required_services_
+procedure. We can change this in the same way as __instantiate_network_ before:
+!rename _instantiate_network _instantiate_network-vanilla
+
+In this case, we want the original to claim all services it knows before we claim
+the _Terminal_ session.
+!# This overloads the bind_required_services with our own version
+!proc bind_required_services { &services } {
+!	upvar 1 ${&services} services
+!
+!	# make sure to declare variables locally
+!	variable start_nodes routes archives modules
+!
+!	# first let the base claim the services it needs
+!	set _res [bind_required_services-vanilla services]
+!	append  start_nodes         [lindex $_res 0]
+!	append  routes              [lindex $_res 1]
+!	lappend runtime_archives {*}[lindex $_res 2]
+!	lappend rom_modules      {*}[lindex $_res 3]
+!
+!	##
+!	# instantiate jitter_sponge terminal driver if required by runtime
+!	if {[info exists services(terminal)]} {
+!		set random_found 0
+!		foreach terminal_node ${services(terminal)} {
+!			set terminal_label_node [query_from_string string(*/@label) $terminal_node  ""]
+!
+!			# here we only handle Terminal with the label random
+!			if {$terminal_label_node != "random"} { continue }
+!
+!			set i [lsearch -regexp ${services(terminal)} "label=\"random\""]
+!			set services(terminal) [lreplace ${services(terminal)} $i $i]
+!
+!			if { $random_found > 0 } {
+!				log "Ignoring all but the first required <terminal label=\"random\"/> service"
+!				continue
+!			}
+!			incr random_found
+!
+!			append routes "\n\t\t\t\t\t" \
+!			              "<service name=\"Terminal\"> " \
+!			              "<child name=\"jitter_sponge\"/> " \
+!			              "</service>"
+!
+!			_instantiate_random start_nodes runtime_archives rom_modules
+!		}
+!	}
+!
+!	return [list $start_nodes $routes $runtime_archives $rom_modules]
+!}
+
+Now, we only need to instantiate the jitter_sponge component and ensure the
+archive is available in the test.
+
+!proc _instantiate_random { &start_nodes &archives &modules } {
+!	upvar 1 ${&start_nodes} start_nodes
+!	upvar 1 ${&archives} archives
+!	upvar 1 ${&modules} modules
+!
+!	global run_as
+!
+!	append start_nodes {
+!			<start name="jitter_sponge" caps="300">
+!				<resource name="RAM" quantum="2M"/>
+!				<provides> <service name="Terminal"/> </provides>
+!				<route> <any-service> <parent/> </any-service> </route>
+!			</start>
+!	}
+!
+!	lappend modules jitter_sponge
+!
+!	lappend archives "$run_as/src/jitter_sponge"
+!}
+
+To set up the tap1 device you can use the following Linux commands:
+! sudo ip tuntap add dev tap1 mode tap user $USER
+! sudo ip address flush dev tap1
+! sudo ip address add 169.254.71.1/24 brd 169.254.71.255 dev tap1
+! sudo ip link set dev tap1 addr 02:00:00:ca:fe:01
+! sudo ip link set dev tap1 up
+!
+! sudo sysctl -w net.ipv4.ip_forward=1
+!}
+
+This article summarizes how you can add a target for two specific sessions:
+* A Terminal session that provides random data
+* A Nic session wired to a Linux tap device to test a Genode sub-system containing
+  a web server.
