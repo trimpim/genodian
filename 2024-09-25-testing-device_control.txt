@@ -1,0 +1,125 @@
+﻿
+
+       Control the devices in your testing fleet
+
+
+Imagine having a number of devices in a testing fleet, which you use to test your changes
+periodically or on each push to the repository. You are faced with the challenge of controlling
+these devices. In this article, I describe the solution we at Gapfuit came up with.
+
+
+The run tool from Genode supports turning on/off devices via scripts located in
+'tool/run/power_on' and 'tool/run/power_off'. It also collects the log output via
+'tool/run/log' scripts.
+
+In the past, we used power sockets that have an ethernet connection and allow us to power on/off
+plugged-in devices remotely. These worked well for some time, but they seem to not like the
+current spike: About every five to six months, we had a failure due to one of the relays
+no longer opening, as it looks as if it has welded itself shut.
+
+[image power_socket] network controllable power sockets, port 1 is defective
+
+These failures were tedious and expensive, and the equipment used a lot of space. Therefore
+we needed a new solution.
+
+As all of the devices in our test fleet can run on something like 9 to 24 Volts, my idea
+was to have one single (powerful) power supply of 12 Volts and to switch the low
+voltage side instead of the 230 Volt side. Also, the specification for the
+relays should be oversized to be on the safe side regarding the inrush current on
+power up of devices.
+
+First idea
+----------
+
+Our first idea was to use a relay board controlled via RS-485 (Modbus). These
+can be bought relatively cheaply on E-Bay. We also wanted to use a device running our operating
+system to control the power delivery.
+
+[image relays_board_gateway] the relays board and the gateway
+
+In my spare time, I started two pet projects: one enabling the UART user-land driver for the
+iMX8 SoC and the other porting a Python library to control the relays via Modbus to C++.
+The idea behind this is to use one of our imx8mm IoT gateway devices to control the power
+of our testing infrastructure. I presented this at Hack'n'Hike 2024, but for different reasons,
+I haven't made much progress yet.
+
+Speed up because of increased failures
+--------------------------------------
+
+However, we needed a more timely solution as more power sockets stopped working. After some
+searching we found what we think should solve our headaches regarding dying power sockets.
+Our current approach uses the Modbus POE ETH relay from Waveshare, which can be controlled via ethernet.
+
+Besides improving reliability, the infrastructure should be clearly arranged and thus
+easier to maintain. Therefore, we introduced a central hub for power delivery.
+* components mounted to DIN rails
+* all wires hidden
+* easy to understand and expand
+* mounted to a wooden board
+
+The current solution
+--------------------
+
+Below is a simplified schematic of the board for anyone who would like to use a similar setup.
+
+[image schematics_power_control] simplified schematics of the control board
+
+* 230V side is connected via an extension cord, this allows to easily disconnect the board for maintenances
+* red is +12V from the power supply
+* black is Ground form the power supply
+* cyan is switched +12V
+* The brown and green lines are two potential free contacts that we need to power on boards that do
+  not support automatically powering on when DC power returns. This could be replaced by two more
+  channels of switched 12V, if there is no need for potential free contacts.
+
+Roman created the necessary run modules to control power on/off with the Waveshare. This can
+be found at [https://github.com/rite/genode/tree/gapfruit-2202-waveshare-power].
+
+[image assembled_board] the assembled board still on the table while testing
+
+[image ci-infra-ng] the whole assembly in action
+
+
+Workflow integration
+--------------------
+
+These run modules can be integrated in to your '<build-dir>/etc/build.conf' as follows:
+!BOARD_RUN_OPT(<board-name>) += \
+!    --include power_on/waveshare \
+!      --power-on-waveshare-host     <waveshare-ip> \
+!      --power-on-waveshare-port     <waveshare-port> \
+!      --power-on-waveshare-channel  <waveshare-channel>
+!
+! BOARD_RUN_OPT(<board-name>) += \
+!    --include power_off/waveshare \
+!      --power-off-waveshare-host     <waveshare-ip> \
+!      --power-off-waveshare-port     <waveshare-port> \
+!      --power-off-waveshare-channel  <waveshare-channel>
+
+
+To widen the ability to capture the output of the devices we switched from uding 'picocom' to 'ser2net'.
+
+You configure 'ser2net' with the file '/etc/ser2net.yaml'
+
+!connection: <device-connection-name>
+!    accepter: telnet,<ser2net-host-ip>,<desired-port>
+!    enable: on
+!    options:
+!        telnet-brk-on-sync: true
+!    connector: serialdev,
+!               /dev/serial/by-id/<serial-device-id>,
+!               115200n81,local
+
+In the run opts for 'tool/run/log/serial' we thereafter can use following settings:
+
+!BOARD_RUN_OPT(<board-name>) += \
+!   --include log/serial \
+!     --log-serial-cmd "netcat <ser2net-host-ip> <desired-port>"
+
+This approach allows a user to look at the log simultaneously as the run script running on the pipeline.
+
+Also, developers do not need a target device on their desk but can use one hosted in the office
+infrastructure. Of course, this requires some sort of allocation mechanism that ensures a user
+(be it a developer or the testing pipeline) has exclusive access to the target.
+
+I still want to complete the version with the relays module and the IoT gateway in the future.
